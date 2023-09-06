@@ -1,0 +1,237 @@
+import cv2
+import tensorflow as tf
+import numpy as np
+import sys
+import pandas as pd
+import os
+from time import perf_counter
+import tf2onnx
+import tensorrt as trt
+
+from src import Models as models
+from src.DataLoader import DataLoader
+from src import Visualise as vis
+
+
+import time
+import common
+
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+def build_engine(onnx_path,engine_file):
+    trt.init_libnvinfer_plugins(None, '')
+    logger = trt.Logger(trt.Logger.INFO)
+
+    builder = trt.Builder(logger)
+    config = builder.create_builder_config()
+    config.max_workspace_size = 4 * 1 << 30
+
+    flag = (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    network = builder.create_network(flag)
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(str(onnx_path)):
+        raise RuntimeError(f'failed to load ONNX file: {onnx_path}')
+    inputs = [network.get_input(i) for i in range(network.num_inputs)]
+    outputs = [network.get_output(i) for i in range(network.num_outputs)]
+
+    with builder.build_engine(network, config) as engine, open(engine_file, 'wb') as t:
+        t.write(engine.serialize())
+    # LOGGER.info(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+
+
+    return builder.build_engine(network, config)
+
+########################
+
+""" Hyperparameters """
+shape = (256, 256, 1)
+num_classes = 4
+
+d_transforms = {'crop':(486,120,1605,915), # (x1, y1, x2, y2)
+                'resize':(256,256), # (width, height)
+                'one-hot':True
+                                 }
+
+imgs = os.listdir('test_images/raw')
+imgs = ['test_images/raw/'+c for c in imgs]
+
+mks = os.listdir('test_images/ground_truth')
+mks = ['test_images/ground_truth/'+c for c in imgs]
+
+dl = DataLoader(image_paths=imgs,mask_paths=mks,n_classes=4,channels=(1, 1),
+                     augment=False, # No aumentations
+                     shuffle=False, d_transforms=d_transforms,batch_size=100,
+                     seed=47)
+
+def prep_frame(frame, resize=True):
+    # pre-process frame
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame = tf.convert_to_tensor(frame)[tf.newaxis,:,:,tf.newaxis] # convert (h,w) -> (1,h,w,1)
+
+    if resize:
+        return dl.resize_and_rescale(frame) # resize input frame
+    else:
+        return frame
+
+def load_engine(trt_path):
+
+    with open(trt_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
+
+
+class TRTInference(object):
+    """Manages TensorRT objects for model inference."""
+
+    def __init__(self, trt_engine_path):
+        """Initializes TensorRT objects needed for model inference.
+        Args:
+            trt_engine_path (str): path where TensorRT engine should be stored
+        """
+        # TRT engine placeholder
+        self.trt_engine = None
+        if not self.trt_engine:
+            print("Loading cached TensorRT engine from {}".format(
+                trt_engine_path))
+            self.trt_engine = load_engine(trt_engine_path)
+
+        # This allocates memory for network inputs/outputs on both CPU and GPU
+        self.inputs, self.outputs, self.bindings, self.stream = \
+            common.allocate_buffers(self.trt_engine)
+
+        # Execution context is needed for inference
+        self.context = self.trt_engine.create_execution_context()
+
+    def infer(self, img):
+
+
+        # img = img[:,:,0]
+        # img = cv2.resize(img,[256,256])
+        #
+        # img = img/255
+        # img = torch.Tensor(img)
+        #
+        # img = torch.unsqueeze(img, dim=0)
+
+        img_height, img_width = 256,256
+        img = np.array(img)
+        # print(img.shape,type(img))
+        # img = torch.Tensor(img)
+        np.copyto(self.inputs[0].host, img.ravel())
+        t_start = time.time()
+        trt_outputs = common.do_inference(
+            self.context, bindings=self.bindings, inputs=self.inputs,
+            outputs=self.outputs, stream=self.stream)
+        # print("network output shape:{}".format(trt_outputs[0].shape))  # (659920,)
+        print("TensorRT inference time: {} ms".format(int(round((time.time() - t_start) * 1000))))
+        outputs = trt_outputs[0].reshape(1, img_height, img_width,4)    # (2, 584, 565)
+        return outputs
+
+def run_inference(model, input=0, save=None):
+
+    d_times = {'preprocessing': [], 'inference': [], 'display': [], 'total': [], }
+    d_params = {'show':True}
+
+    capture = cv2.VideoCapture(input)
+    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    success, frame0 = capture.read()
+
+    h,w,c = frame0.shape
+    if save:
+        out = cv2.VideoWriter(save, cv2.VideoWriter_fourcc(*'XVID'), 10, (w,h)) # fps, size
+
+
+    if not success:
+        print('Unable to read video at input {}'.format(input))
+
+    size = frame0.shape
+    reshape = (d_transforms['crop'][2] - d_transforms['crop'][0],d_transforms['crop'][3] - d_transforms['crop'][1]) # (x,y)
+    pad = (d_transforms['crop'][1], size[0] - d_transforms['crop'][3],d_transforms['crop'][0], size[1] - d_transforms['crop'][2], ) ## (top, bottom, left, right)
+    print('size:',size,'reshape:',reshape,'pad:',pad)
+
+    while success: # frame read successfully
+
+        t0 = perf_counter()
+
+        # pre-processing
+        frame = prep_frame(frame0)
+
+        t1 = perf_counter()
+
+        # run inference
+        pred_mask = model.infer(frame)
+
+        # print(pred_mask.shape)
+        # print(pred_mask.shape)
+        t2 = perf_counter()
+
+        if d_params['show']:
+
+            pred_mask = pred_mask[0,:,:,:]
+            pred_mask = pred_mask.argmax(axis=2)
+
+            # For cropped view (size input to nn)
+            # frame = frame.numpy()[0,:,:,:]
+            # frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+            # For original size
+            pred_mask = cv2.resize(pred_mask.astype('float32'), reshape, interpolation=cv2.INTER_AREA)
+            pred_mask = cv2.copyMakeBorder(pred_mask, pad[0], pad[1], pad[2], pad[3], cv2.BORDER_CONSTANT)
+            frame = frame0/255
+            #####
+            t = time.time()
+            pred_mask = vis.seg_to_rgb(pred_mask) # convert from 1-hot encoded to 2d array
+            print(time.time()-t)
+            alpha = 0.5
+            overlay = cv2.addWeighted(frame, 1.0, pred_mask, alpha, gamma=0, dtype=cv2.CV_32F) # overlay segmentations to image
+            cv2.imshow('Model output', overlay)
+
+            t3 = perf_counter()
+            print(t3-t0)
+            if save:
+                overlay = cv2.normalize(overlay, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+
+                # overlay = (overlay*(255)).astype(np.uint8)
+                print(overlay.shape)
+                out.write(overlay)
+
+        # quit when 'q' pressed
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+        d_times['preprocessing'].append(t1-t0)
+        d_times['inference'].append(t2-t1)
+        d_times['display'].append(t3-t2)
+        d_times['total'].append(t3-t0)
+
+        success, frame0 = capture.read() # read next frame
+
+    # Close streams
+    capture.release()
+    if save:
+        out.release()
+
+    cv2.destroyAllWindows()
+
+    pd.DataFrame(d_times).to_csv('timing_performance.csv')
+
+if __name__ == '__main__':
+    input = 0#'./assets/Example_1.avi'
+    output = './assets/us_thyroid_1.avi'
+
+
+    # model convert...
+    # model = models.unet(shape, num_classes)
+    # model.load_weights('model.h5')
+    # spec = (tf.TensorSpec((1, 256, 256, 1), tf.float32, name="input"),)
+    # onnx_model, _ = tf2onnx.convert.from_keras(model,input_signature = spec,opset=13)
+    # import onnxmltools
+    # #
+    # onnxmltools.utils.save_model(onnx_model, 'model.onnx')
+    # build_engine('model.onnx','model.engine')
+
+
+    print('convert finished...')
+    unet = TRTInference('model.engine')
+    run_inference(unet, input = input, save=output)
