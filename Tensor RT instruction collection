@@ -1,0 +1,84 @@
+import tensorflow as tf
+import os
+import onnx
+
+def MyNet():
+    input1 = tf.keras.layers.Input(shape=(7, 7, 3))
+
+    x = tf.keras.layers.Conv2D(16, (3, 3),
+               activation='relu',
+               padding='same',
+               name='conv1')(input1)
+    x = tf.keras.layers.Conv2D(16, (3, 3),
+               activation='relu',
+               padding='same',
+               name='conv2')(x)
+
+    x = tf.keras.layers.Flatten(name='flatten')(x)
+    x = tf.keras.layers.Dense(100, activation='relu', name='fc1')(x)
+    output = tf.keras.layers.Dense(2, activation='softmax', name='predictions')(x)
+
+    input_1 = input1
+    model = tf.keras.models.Model(inputs=[input_1], outputs=output)
+    return model
+
+model = MyNet()
+
+
+import onnx
+
+onnx_model = onnx.load("./model.onnx")
+check = onnx.checker.check_model(onnx_model)
+print('Check: ', check)
+
+
+
+import tensorflow as tf
+import onnxruntime
+import numpy as np
+
+input1 = np.random.random((1, 7, 7, 3)).astype('float32')
+
+ort_sess = onnxruntime.InferenceSession("./model.onnx")
+ort_inputs = {ort_sess.get_inputs()[0].name: input1}
+ort_outs = ort_sess.run(None, ort_inputs)
+
+tf_model = tf.saved_model.load(export_dir="model")
+tf_outs = tf_model(inputs=input1)
+
+print(ort_outs[0])
+print(tf_outs.numpy())
+np.testing.assert_allclose(tf_outs.numpy(), ort_outs[0], rtol=1e-03, atol=1e-05)
+print("onnx model check finsh.")
+
+
+
+import tensorflow as tf
+import os
+
+def MyNet():
+    input1 = tf.keras.layers.Input(shape=(7, 7, 3))
+    input2 = tf.keras.layers.Input(shape=(7, 7, 3))
+
+    x = tf.keras.layers.Conv2D(16, (3, 3),
+               activation='relu',
+               padding='same',
+               name='conv1')(input1)
+    y = tf.keras.layers.Conv2D(16, (3, 3),
+               activation='relu',
+               padding='same',
+               name='conv2')(input2)
+    z = tf.keras.layers.Concatenate(axis=-1)([x, y])
+    z = tf.keras.layers.Flatten(name='flatten')(z)
+    z = tf.keras.layers.Dense(100, activation='relu', name='fc1')(z)
+    output = tf.keras.layers.Dense(2, activation='softmax', name='predictions')(z)
+
+    input_1 = input1
+    input_2 = input2
+    model = tf.keras.models.Model(inputs=[input_1,input_2], outputs=output)
+    return model
+
+model = MyNet()
+
+model.save('model')
+os.system("python -m tf2onnx.convert --saved-model model --output model.onnx --opset 11")
